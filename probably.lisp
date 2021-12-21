@@ -1,4 +1,10 @@
 ;;; probably.lisp – a toy probabilistic programming framework based on Gen.jl
+;;
+;; This code was written as an exercise to understand what
+;; probabilistic programming is all about, particularly while looking
+;; at Gen.jl (http://gen.dev/) and reading part of the associated thesis.
+;;
+;; Written by Luke Gorrie <luke@nuddy.co> in 2021. MIT license.
 
 (defpackage :probably
   (:use :common-lisp :alexandria :serapeum)
