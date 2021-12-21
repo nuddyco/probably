@@ -29,24 +29,10 @@
   "Probability value in [0,1]."
   '(double-float 0d0 1d0))
 
-(def ε double-float-epsilon
-  "Smallest non-zero log-probability value.")
-
 (deftype addr ()
   "Address of a random value in a trace.
    Can have any concrete type."
   t)
-
-(def □ '□
-  "Special value for 'missing' values of unbound random variables.")
-
-(deftype □ () '(eq □))
-
-(defun present? (value)
-  "True if VALUE is not the missing value □."
-  (not (eq value □)))
-
-;;;; Traces
 
 (defstruct trace
   "Recording of one execution of a model.
@@ -60,8 +46,71 @@
 (defvar-unbound *trace*
   "The trace that is currently being recorded.")
 
-(defvar *observations* (dict)
-  "Fixed random choices provided from outside the model.")
+(def □ '□
+  "Special value for 'missing' values of unbound random variables.")
+
+(deftype □ () '(eq □))
+
+(defun present? (value)
+  "True if VALUE is not the missing value □."
+  (not (eq value □)))
+
+;;;; Core engine
+
+;;;;; Making random choices
+
+(-> probably (addr t function function) t)
+(defun probably (addr observation sample-fn log-likelihood-fn)
+  "Bind a random variable to its value and record probability score."
+  (let ((value (cond ((present? observation) observation)
+                     ((constrained? addr)    (constraint addr))
+                     (t                      (funcall sample-fn)))))
+    (assert (present? value))
+    (when (bound? addr)
+      ;; Maybe we should allow compatible values? Not sure yet. Play it safe.
+      (with-simple-restart (continue "Continue with value ~s" value)
+        (error "Address ~s already bound to ~s when binding to ~s")))
+    (bind! addr value (funcall log-likelihood-fn value))
+    value))
+
+(-> bind! (addr t logprob) t)
+(defun bind! (addr value log-likelihood)
+  "Bind ADDRESS to VALUE accounting for LOG-LIKELIHOOD."
+  ;; XXX Gen registers prefixes of addresses. Why?
+  (incf (trace-score *trace*) log-likelihood)
+  (setf (@ (trace-choices *trace*) addr) value))
+
+;;;;; Running models
+
+(-> generate (model &key (:args t) (:constraints choicemap)) (values t logprob trace))
+(defun generate (model &key args (constraints (dict)))
+  "Generate a trace by simulating MODEL.
+   CONSTRAINTS optionally maps random variable addresses to fixed values."
+  (let ((*trace* (make-trace :model model :args args :constraints constraints)))
+    (values (apply model args) (trace-score *trace*) *trace*)))
+
+
+(defun metropolis-hastings (model n &key args (warmup 100) (constraints (dict)))
+  "Return N representative samples from MODEL."
+  (sort (subseq (loop for seq from 0
+                      with sample = (lambda ()
+                                      (generate model :args args :constraints constraints))
+                      with collected = (- warmup)
+                      with ref = (nth-value 1 (funcall sample))
+                      for (value logprob trace) = (multiple-value-list (funcall sample))
+                      for α = (if (> logprob ref)
+                                  1d0
+                                  (exp (max (log double-float-epsilon) (- logprob ref))))
+                      for r = (random 1.0d0)
+                      when (<= r α)
+                        collect (prog1 trace
+                                  (setf ref logprob)
+                                  (incf collected))
+                while (< collected n))
+                warmup)
+        #'> :key #'trace-score))
+
+;;;; Querying and updating traces
 
 (defun bound? (addr &optional (trace *trace*))
   "Is the random variable with ADDR already bound to a value?"
@@ -84,8 +133,6 @@
 (defun hash-table-includes? (hash-table key)
   "Does HASH-TABLE include KEY?"
   (nth-value 1 (@ hash-table key)))
-
-;;;; ADTs
 
 ;;;; Probability distributions
 
@@ -139,59 +186,6 @@
   (probably addr value
             (op value)
             (op (if (eq _ value) (log 1d0) 0d0))))
-
-;;;; Core engine
-
-;;;;; Making random choices
-
-(-> probably (addr t function function) t)
-(defun probably (addr observation sample-fn log-likelihood-fn)
-  "Bind a random variable to its value and record probability score."
-  (let ((value (cond ((present? observation) observation)
-                     ((constrained? addr)    (constraint addr))
-                     (t                      (funcall sample-fn)))))
-    (assert (present? value))
-    (when (bound? addr)
-      ;; Maybe we should allow compatible values? Not sure yet. Play it safe.
-      (with-simple-restart (continue "Continue with value ~s" value)
-        (error "Address ~s already bound to ~s when binding to ~s")))
-    (bind! addr value (funcall log-likelihood-fn value))
-    value))
-
-(-> bind! (addr t logprob) t)
-(defun bind! (addr value log-likelihood)
-  "Bind ADDRESS to VALUE accounting for LOG-LIKELIHOOD."
-  ;; XXX Gen registers prefixes of addresses. Why?
-  (incf (trace-score *trace*) log-likelihood)
-  (setf (@ (trace-choices *trace*) addr) value))
-
-;;;;; Running models
-
-(-> generate (model &key (:args t) (:constraints choicemap)) (values t logprob trace))
-(defun generate (model &key args (constraints (dict)))
-  (let ((*trace* (make-trace :model model :args args :constraints constraints)))
-    (values (apply model args) (trace-score *trace*) *trace*)))
-
-
-(defun metropolis-hastings (model n &key args (warmup 100) (constraints (dict)))
-  "Return N representative samples from MODEL."
-  (sort (subseq (loop for seq from 0
-                      with sample = (lambda ()
-                                      (generate model :args args :constraints constraints))
-                      with collected = (- warmup)
-                      with ref = (nth-value 1 (funcall sample))
-                      for (value logprob trace) = (multiple-value-list (funcall sample))
-                      for α = (if (> logprob ref)
-                                  1d0
-                                  (exp (max (log double-float-epsilon) (- logprob ref))))
-                      for r = (random 1.0d0)
-                      when (<= r α)
-                        collect (prog1 trace
-                                  (setf ref logprob)
-                                  (incf collected))
-                while (< collected n))
-                warmup)
-        #'> :key #'trace-score))
 
 ;;;; Examples
 
@@ -279,3 +273,11 @@
             (iota 10)
             (mapcar (op (or (@ freq _) 0)) (iota 10)))))
 
+(defun polydemo ()
+  ;; might take a minute or so...
+  (let* ((data (loop for i from 1 to 5
+                     collect (+ 1.0d0 (* i -1) (* 0.5 (expt i 3)))))
+         (traces (metropolis-hastings (op (polynomial-model data)) 100)))
+    (polyreport traces)))
+
+    
