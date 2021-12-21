@@ -1,14 +1,13 @@
+;;; probably.lisp – a toy probabilistic programming framework based on Gen.jl
+
 (defpackage :probably
-  (:use :common-lisp :alexandria :serapeum :let-plus)
+  (:use :common-lisp :alexandria :serapeum)
   (:shadow #:trace))
 (in-package :probably)
 
-(defmacro λ (args &body body) `(lambda ,args ,@body))
+(eval-always (setf *read-default-float-format* 'double-float))
 
-;;; TODO
-;;; - Separate get-random-number and logprob
-;;; - Metropolis-Hastings
-;;; - Gamma distribution
+(defmacro λ (args &body body) `(lambda ,args ,@body))
 
 ;;;; Basic types
 
@@ -24,23 +23,28 @@
 (deftype logprob ()
   "Logarithm of a probability value.
    Used for the sake of floating point accuracy."
-  '(real * #.(log 1)))
+  '(double-float * #.(log 1d0)))
 
 (deftype probability ()
   "Probability value in [0,1]."
-  '(real 0 1))
+  '(double-float 0d0 1d0))
+
+(def ε double-float-epsilon
+  "Smallest non-zero log-probability value.")
 
 (deftype addr ()
   "Address of a random value in a trace.
    Can have any concrete type."
   t)
 
-(defunit ◯
+(def □ '□
   "Special value for 'missing' values of unbound random variables.")
 
+(deftype □ () '(eq □))
+
 (defun present? (value)
-  "True if VALUE is not the missing value ◯."
-  (not (eq value ◯)))
+  "True if VALUE is not the missing value □."
+  (not (eq value □)))
 
 ;;;; Traces
 
@@ -63,6 +67,9 @@
   "Is the random variable with ADDR already bound to a value?"
   (hash-table-includes? (trace-choices trace) addr))
 
+(defun bindings (&optional (trace *trace*))
+  (hash-table-plist (trace-choices trace)))
+
 (defun binding (addr &optional (trace *trace*))
   (@ (trace-choices trace) addr))
 
@@ -80,36 +87,62 @@
 
 ;;;; ADTs
 
-;;;;; Model
-
-(-> generate (model &key (:args t) (:constraints choicemap)) (values t probability trace))
-(defun generate (model &key args (constraints (dict)))
-  (let ((*trace* (make-trace :model model :args args :constraints constraints)))
-    (values (apply model args) (exp (trace-score *trace*)) *trace*)))
-
-;;;;; Trace
-
-(-> logpdf (trace) number)
-(defun logpdf (trace)
-  (trace-score trace))
-
-(-> choices (trace) choicemap)
-(-> update (trace choicemap &optional t) trace)
-
 ;;;; Probability distributions
 
+;;;;; Bernoulli
+
 (-> bernoulli (number addr &optional t) t)
-(defun bernoulli (p addr &optional (outcome ◯))
+(defun bernoulli (p addr &optional (outcome □))
   (probably addr outcome
-            (op (bernoulli-sample p)) (op (bernoulli-log-likelihood p _))))
+            (op (bernoulli-sample p))
+            (op (bernoulli-log-likelihood p _))))
 
 (defun bernoulli-sample (p)
   "Return one sample from a Bernoulli(P) distribution."
-  (< (random 1.0) p))
+  (< (random 1.0d0) p))
 
 (defun bernoulli-log-likelihood (p outcome)
-  "Return the Bernoulli(P) log-likelihood of OUTCOME."
+  "Return the Bernoulli(P) likelihood of OUTCOME."
   (log (if outcome p (- 1 p))))
+
+;;;;; Normal
+
+;;(-> normal (addr real real &optional (or real □)) t)
+(defun normal (addr μ σ &optional (outcome □))
+  (probably addr outcome
+            (op (normal-sample μ σ))
+            (op (normal-log-likelihood μ σ _))))
+
+(defun normal-sample (μ σ)
+  "Sample one value from Normal(μ,σ)."
+  (+ μ (* σ (unit-normal-sample))))
+
+(defun unit-normal-sample ()
+  "Sample one value from Normal(0,1)."
+  (loop for u1 = (random 1.0d0)
+        for u2 = (random 2.0d0)
+        when (> u1 single-float-epsilon)
+          do (return (* (sqrt (* -2 (log u1)))
+                        (cos (* pi 2 u2))))))
+
+(defun normal-log-likelihood (μ σ x)
+  "Return the likelihood of Normal(μ,σ) at X."
+  (let ((z (/ (- x μ) σ)))
+    (- 0
+       (log σ)
+       (/ (+ (* z z) (log (* pi 2))) 2))))
+
+;;;;; Known
+
+(defun known (addr value)
+  "Known VALUE at ADDRESS with probability 1."
+  (probably addr value
+            (op value)
+            (op (if (eq _ value) (log 1d0) 0d0))))
+
+;;;; Core engine
+
+;;;;; Making random choices
 
 (-> probably (addr t function function) t)
 (defun probably (addr observation sample-fn log-likelihood-fn)
@@ -117,6 +150,7 @@
   (let ((value (cond ((present? observation) observation)
                      ((constrained? addr)    (constraint addr))
                      (t                      (funcall sample-fn)))))
+    (assert (present? value))
     (when (bound? addr)
       ;; Maybe we should allow compatible values? Not sure yet. Play it safe.
       (with-simple-restart (continue "Continue with value ~s" value)
@@ -131,59 +165,37 @@
   (incf (trace-score *trace*) log-likelihood)
   (setf (@ (trace-choices *trace*) addr) value))
 
-;;;; Importance sampling
-;;;
-;;; Bayesian Data Analysis (BDA3), section 10.4.
+;;;;; Running models
 
-#|
-(-> importance-sampling (model choicemap model (integer 0 *)))
-(defun importance-sampling (model observations proposal-model n)
-  (loop for i from 0 below n 
-        for proposed-trace = (simulate proposal-model)
-        for all-choices = (merge observations (trace-choices proposed-trace))
-        for trace = (generate model all-choices)
-        for weight = (- (logpdf trace) (logpdf proposed-trace))
-        collecting trace into traces
-        collecting (log weight) into log-weights
-        finally (let ((ℓ (logsumexp log-weights)))
-                  (return (mapcar (λ (trace log-weight)
-                                    (list trace (- log-weight ℓ)))
-                                  traces log-weights)))))
+(-> generate (model &key (:args t) (:constraints choicemap)) (values t logprob trace))
+(defun generate (model &key args (constraints (dict)))
+  (let ((*trace* (make-trace :model model :args args :constraints constraints)))
+    (values (apply model args) (trace-score *trace*) *trace*)))
 
- (return (mapcar (λ (trace weight)
-                                  (list trace (/ weight (sum weights)))))
-
-        collecting trace into traces
-        collecting (- (logpdf trace) (logpdf proposed-trace)) into weights
-        finally (return (mapcar (λ (trace weight)
-                                  (list trace (- weight (logsumexp weights))))))
-        summing (logpdf proposed-trace) into sum
-        collect (list trace weight)))
-
-(defun logsumexp (seq)
-  ;; Equations 1.6 and 1.7 of Gen thesis
-  (let ((max (extremum seq #'>)))
-    (+ max (log (loop for x in seq summing (exp (- x max)))))))
-|#
-
-;;;; Metropolis-Hastings
 
 (defun metropolis-hastings (model n &key args (warmup 100) (constraints (dict)))
   "Return N representative samples from MODEL."
-  (subseq (loop with sample = (lambda ()
-                                (generate model :args args :constraints constraints))
-                with remaining = (+ n warmup)
-                with p₀ = (nth-value 1 (funcall sample))
-                for (value p trace) = (multiple-value-list (funcall sample))
-                for accept-threshold = (/ p p₀)
-                when (> accept-threshold (random 1.0))
-                  collect (prog1 trace
-                            (setf p₀ p)
-                            (decf remaining))
-                while (plusp remaining))
-          warmup))
+  (sort (subseq (loop for seq from 0
+                      with sample = (lambda ()
+                                      (generate model :args args :constraints constraints))
+                      with collected = (- warmup)
+                      with ref = (nth-value 1 (funcall sample))
+                      for (value logprob trace) = (multiple-value-list (funcall sample))
+                      for α = (if (> logprob ref)
+                                  1d0
+                                  (exp (max (log double-float-epsilon) (- logprob ref))))
+                      for r = (random 1.0d0)
+                      when (<= r α)
+                        collect (prog1 trace
+                                  (setf ref logprob)
+                                  (incf collected))
+                while (< collected n))
+                warmup)
+        #'> :key #'trace-score))
 
-;;;; Testing
+;;;; Examples
+
+;;;;; Burglary model
 
 (defun burglary ()
   "Burglary model as a probabilistic program.
@@ -212,4 +224,58 @@
          (calls (count-if (op (binding :calls _)) traces)))
     (format t "~&Out of ~A burglaries there were ~A calls (~,2f%)~%"
             samples calls (* 100.0 (/ calls samples)))))
+
+;;;;; Linear regression
+
+(defun center (xs)
+  (loop with μ = (normal :μ (mean xs) 1)
+        for i from 0
+        for x in xs
+        do (normal `(:x ,i) μ 1 x)))
+
+(defun linear-model (xs)
+  ;; Model parameters with broad priors
+  (let ((slope     (normal :slope     0 10))
+        (intercept (normal :intercept 0 10)))
+    ;; Parameter (:X <index>) for each value in XS.
+    (loop for i from 0
+          for x in xs
+          for prediction = (+ intercept (* slope i))
+          ;; Predict points to be near the line
+          ;; described by the model parameters.
+          do (normal `(:x ,i) prediction 0.1 x))))
+
+(defun report (traces)
+  (format t "~&intercept   slope   log-probability")
+  (loop for trace in (sort (copy-list traces) #'< :key #'trace-score)
+        do (format t "~& ~8,3f  ~6,3f  ~10,5f"
+                   (binding :intercept trace)
+                   (binding :slope trace)
+                   (trace-score trace))))
+
+;;;;; Polynomial regression
+
+(defun polynomial-model (xs)
+  (loop ;; Keep adding powers while a coin-toss comes up heads.
+        with order = (known :order (loop while (bernoulli 0.5 (gensym)) count t))
+        ;; Distribute coefficients normally around zero.
+        with coeff = (loop for i upto order collect (normal i 0 0.5))
+        ;; The polynomial prediction function
+        with polyf  = (λ (n) (loop for k in coeff
+                                   for power from 0
+                                   summing (* k (expt n power))))
+        ;; Make prediction
+        for n from 0
+        for prediction = (funcall polyf n)
+        ;; Match prediction to observation
+        for x in xs
+        do (normal `(:x ,n) prediction 1 x)))
+
+(defun polyreport (traces)
+  (let ((freq (frequencies traces :key (op (binding :order _)))))
+    (format t "~&How many terms (n) in k₀ + k₁*x + k₂*x² + ... + kₙ*xⁿ?~%~
+                 Terms: ~{~4d ~}~%~
+                 Count: ~{~4d ~}~%"
+            (iota 10)
+            (mapcar (op (or (@ freq _) 0)) (iota 10)))))
 
